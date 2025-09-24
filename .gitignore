@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+.venv
+.envrc
+.ipynb_checkpoints/
+.DS_Store
+# Data artifacts
+/data/
+!data/README.md
+
+# Local python packaging
+*.egg-info/

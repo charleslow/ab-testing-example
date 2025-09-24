@@ -1,0 +1,13 @@
+[project]
+name = "ab-testing-example"
+version = "0.1.0"
+description = "Simple A/A testing example on a sample of the Criteo click dataset."
+authors = [{name = "Example Author"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "scipy>=1.8",
+]
+
+[tool.ruff]
+line-length = 100
