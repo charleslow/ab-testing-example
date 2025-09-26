@@ -1,15 +1,33 @@
-"""Run a simple A/A test using a two-tailed independent t-test from SciPy."""
+"""Run repeated A/A tests on the provided dataset.
+
+The aim is to demonstrate the danger of mismatched assignment and analysis levels.
+
+The script assigns treatment at the user_id level, but analyses the results at three different
+levels: row, impression_id, and user_id.
+
+Each trial randomly assigns users to control or treatment using a hash function with a trial-specific
+salt. This ensures that treatment assignment is independent across trials.
+
+The click-through rate (CTR) is computed for each group at the specified analysis level. Since
+this is an A/A test, we expect no difference in CTR between control and treatment groups.
+A significant p-value indicates a false positive.
+
+We expect the false positive rate to be close to the significance level (alpha) when
+the assignment and analysis levels match (user_id). However, when they do not match (row or impression_id),
+the false positive rate may be inflated.
+"""
 
 from __future__ import annotations
 
 import argparse
-import csv
-import pathlib
-import random
 import statistics
+import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
+import pandas as pd
+import xxhash
+from datasets import load_dataset
 from scipy import stats
 
 
@@ -17,145 +35,143 @@ from scipy import stats
 class AaTestResult:
     control_mean: float
     treatment_mean: float
-    difference: float
     p_value: float
     control_size: int
     treatment_size: int
+    control_std: float
+    treatment_std: float
 
 
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--data-path",
-        type=pathlib.Path,
-        default=pathlib.Path("data/raw/criteo_sample.csv"),
-        help="Path to the dataset file (comma-separated by default).",
+def t_test(control: Iterable[float], treatment: Iterable[float]) -> AaTestResult:
+    control_list = list(control)
+    treatment_list = list(treatment)
+    control_mean = statistics.fmean(control_list)
+    treatment_mean = statistics.fmean(treatment_list)
+    _, p_value = stats.ttest_ind(
+        control_list, treatment_list, equal_var=True, alternative="two-sided"
     )
-    parser.add_argument(
-        "--metric-column",
-        default="0",
-        help=(
-            "Column containing the binary click label. Provide either a zero-based index "
-            "or a column name if the file has headers."
-        ),
+    control_std = statistics.stdev(control_list)
+    treatment_std = statistics.stdev(treatment_list)
+    return AaTestResult(
+        control_mean=control_mean,
+        treatment_mean=treatment_mean,
+        p_value=p_value,
+        control_size=len(control_list),
+        treatment_size=len(treatment_list),
+        control_std=control_std,
+        treatment_std=treatment_std,
     )
-    parser.add_argument(
-        "--delimiter",
-        default=",",
-        help="Field delimiter used in the dataset (default: comma).",
+
+
+def _hash_to_bucket(value: str) -> int:
+    """Return 0 or 1 from hashing the provided string with xxhash64."""
+    return xxhash.xxh64(value).intdigest() % 2
+
+
+def compute_group_level_ctr(df: pd.DataFrame, group: str):
+    """Compute per-(group, treatment) CTR.
+
+    Validation:
+      * Requires columns: group, treatment, click.
+      * Raises ValueError if any group key maps to BOTH treatment=True and treatment=False
+        (i.e., inconsistent assignment relative to the randomisation unit).
+    """
+    required_cols = {group, "treatment", "click"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"DataFrame missing required columns: {missing}")
+
+    # Aggregate clicks and counts for each (group, treatment) pair
+    agg = df.groupby([group, "treatment"], as_index=False)["click"].agg(
+        click_sum="sum", count="count"
     )
+
+    # Identify groups that have both treatment True & False assignments (inconsistent assignment)
+    treatment_counts = agg.groupby(group)["treatment"].nunique()
+    invalid_groups = treatment_counts[treatment_counts > 1].index
+    if len(invalid_groups) > 0:
+        raise ValueError(
+            "Found groups with inconsistent treatment assignment (group appears in both arms): "
+            f"{invalid_groups.tolist()}"
+        )
+
+    # Compute CTR
+    agg["ctr"] = agg["click_sum"] / agg["count"]
+    return agg[[group, "treatment", "ctr", "count"]]
+
+
+def assign_control_treatment(df: pd.DataFrame, level: str, suffix: str) -> pd.DataFrame:
+    if level not in df.columns:
+        raise ValueError(f"Level column '{level}' not found in DataFrame.")
+
+    unique_ids = df[level].astype(str).unique()
+    id_to_bucket = {uid: _hash_to_bucket(f"{uid}_{suffix}") for uid in unique_ids}
+    df["bucket"] = df[level].astype(str).map(id_to_bucket)
+    df["treatment"] = df["bucket"] == 1
+    return df
+
+
+def run_trials(
+    df: pd.DataFrame,
+    level: str,
+    trials: int,
+    alpha: float,
+) -> None:
+    false_positives = 0
+    p_values: List[float] = []
+
+    for trial_index in range(trials):
+        # Re-assign treatment at user level with trial-specific salt so hash differs each attempt
+        assigned_df = assign_control_treatment(df.copy(), level="user_id", suffix=str(trial_index))
+
+        # Aggregate to group level CTRs
+        group_ctr_df = compute_group_level_ctr(assigned_df, group=level)
+
+        control = group_ctr_df.loc[~group_ctr_df["treatment"], "ctr"].tolist()
+        treatment = group_ctr_df.loc[group_ctr_df["treatment"], "ctr"].tolist()
+
+        result = t_test(control, treatment)
+        p_values.append(result.p_value)
+        if result.p_value < alpha:
+            false_positives += 1
+
+    print("=== A/A Test Summary ===")
+    print(f"Level: {level}")
+    print(f"Trials: {trials}")
+    print(f"Alpha: {alpha}")
+    fp_rate = (false_positives / trials * 100.0) if trials > 0 else float("nan")
+    print(f"False positives: {false_positives} ({fp_rate:.2f}%)")
+
+
+def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run repeated A/A tests.")
+    parser.add_argument("--trials", type=int, default=100, help="Number of valid trials to run.")
+    parser.add_argument("--alpha", type=float, default=0.05, help="Significance threshold.")
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed used when assigning samples to the two buckets.",
-    )
-    parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.5,
-        help="Proportion of observations assigned to the treatment bucket (default: 0.5).",
-    )
-    parser.add_argument(
-        "--has-header",
+        "--debug",
         action="store_true",
-        help="Treat the first row of the file as a header row.",
+        help="Run in debug mode with a smaller dataset.",
     )
     return parser.parse_args(argv)
 
 
-def load_metric(
-    data_path: pathlib.Path,
-    metric_column: str,
-    delimiter: str = ",",
-    has_header: bool = False,
-) -> List[float]:
-    metric_index: Optional[int] = None
-    column_name: Optional[str] = None
-
-    if metric_column.isdigit():
-        metric_index = int(metric_column)
-    else:
-        column_name = metric_column
-
-    values: List[float] = []
-    with data_path.open("r", newline="") as csvfile:
-        reader = csv.reader(csvfile, delimiter=delimiter)
-        if has_header:
-            header = next(reader, None)
-            if header is None:
-                return values
-            if column_name is not None:
-                try:
-                    metric_index = header.index(column_name)
-                except ValueError as exc:  # pragma: no cover - defensive
-                    raise ValueError(f"Column '{column_name}' not found in header") from exc
-        if metric_index is None:
-            raise ValueError(
-                "Metric column must be a zero-based index unless --has-header is provided with a valid name."
-            )
-        for row in reader:
-            if not row:
-                continue
-            try:
-                values.append(float(row[metric_index]))
-            except (IndexError, ValueError):
-                continue
-    return values
-
-
-def run_aa_test(metric: List[float], seed: int = 42, test_size: float = 0.5) -> AaTestResult:
-    if not 0.0 < test_size < 1.0:
-        raise ValueError("test_size must be between 0 and 1")
-
-    rng = random.Random(seed)
-    treatment: List[float] = []
-    control: List[float] = []
-    for value in metric:
-        if rng.random() < test_size:
-            treatment.append(value)
-        else:
-            control.append(value)
-
-    if len(control) < 2 or len(treatment) < 2:
-        raise ValueError("Both groups must contain at least two observations.")
-
-    control_mean = statistics.fmean(control)
-    treatment_mean = statistics.fmean(treatment)
-    difference = treatment_mean - control_mean
-
-    _, p_value = stats.ttest_ind(control, treatment, equal_var=True, alternative="two-sided")
-
-    return AaTestResult(
-        control_mean=control_mean,
-        treatment_mean=treatment_mean,
-        difference=difference,
-        p_value=p_value,
-        control_size=len(control),
-        treatment_size=len(treatment),
-    )
-
-
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    metric = load_metric(
-        args.data_path,
-        str(args.metric_column),
-        delimiter=args.delimiter,
-        has_header=args.has_header,
-    )
-    if not metric:
-        raise ValueError("No valid observations were loaded from the dataset.")
 
-    result = run_aa_test(metric, seed=args.seed, test_size=args.test_size)
+    ds = load_dataset("criteo/FairJob", split="train")
+    df = ds.to_pandas()
+    if args.debug:
+        df = df.head(10_000)
+    df["row"] = df.index
 
-    print("Control group size:", result.control_size)
-    print("Treatment group size:", result.treatment_size)
-    print("Control mean CTR:", f"{result.control_mean:.4f}")
-    print("Treatment mean CTR:", f"{result.treatment_mean:.4f}")
-    print("Difference (treatment - control):", f"{result.difference:.4f}")
-    print("Two-tailed p-value:", f"{result.p_value:.6f}")
+    for level in ["row", "impression_id", "user_id"]:
+        run_trials(
+            df=df,
+            level=level,
+            trials=args.trials,
+            alpha=args.alpha,
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover
-    main()
+    main(sys.argv[1:])

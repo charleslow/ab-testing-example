@@ -1,50 +1,52 @@
-# AB Testing Example
+# AA Testing Example
 
-This repository demonstrates a minimal workflow for running an A/A test on a sample of the
-[Criteo Display Advertising Challenge](https://www.kaggle.com/c/criteo-display-ad-challenge)
-dataset. The example focuses on two utilities:
+Run repeated A/A tests on the provided dataset.
 
-1. `scripts/download_criteo_sample.py` downloads a small, publicly hosted sample of the dataset.
-2. `run_aa_test.py` performs a two-tailed t-test to validate that randomly assigned buckets have
-   no statistically significant difference in click-through rate.
+The aim is to demonstrate the danger of mismatched assignment and analysis levels.
+
+The script assigns treatment at the `user_id` level, but analyses the results at three different levels: row, `impression_id`, and `user_id`.
+
+Each trial randomly assigns users to control or treatment using a hash function with a trial-specific salt. This ensures that treatment assignment is independent across trials.
+
+The click-through rate (CTR) is computed for each group at the specified analysis level. Since this is an A/A test, we expect no difference in CTR between control and treatment groups. A significant p-value indicates a false positive.
+
+We expect the false positive rate to be close to the significance level (`alpha`) when the assignment and analysis levels match (`user_id`). However, when they do not match (row or `impression_id`), the false positive rate may be higher than expected.
 
 ## Getting started
 
-Create and activate a virtual environment, then install the project in editable mode. The
-repository depends on [SciPy](https://scipy.org/) for the statistical test, so `pip` will fetch it
-as part of the installation:
+Create and activate a virtual environment, then install the project in editable mode.
 
 ```bash
-python -m venv .venv
+uv venv
 source .venv/bin/activate
-pip install -e .
+uv pip install -e .
 ```
-
-## Downloading the sample dataset
-
-Use the download helper to fetch the 10k row sample provided by the RecoHut project. The command
-below stores the file under `data/raw/criteo_sample.csv` (which is ignored by git):
-
-```bash
-python scripts/download_criteo_sample.py
-```
-
-If the file already exists you can supply `--overwrite` to refresh it. A different source URL can be
-provided with `--url` when needed.
 
 ## Running the A/A test
 
-Once you have a dataset available, run the A/A test script. The following command loads the
-downloaded sample and splits the observations into equal-sized buckets:
-
 ```bash
-python run_aa_test.py --data-path data/raw/criteo_sample.csv
+uv run python run_aa_test.py --trials 100 --alpha 0.05
 ```
 
-If you stored the sample under the default location you can omit `--data-path` entirely. Supply
-`--delimiter` if your dataset uses a separator other than a comma, and `--has-header` when the
-metric column is identified by name.
+The script performs the AA test at the row, impression and user level. Note that it uses the `criteo/FairJob` dataset for the analysis, although the findings from this analysis applies to any dataset where the experiment assignment differs from the level of AB analysis. We expect the false positive rate for the user level to be close to the alpha, but the other levels to be higher.
 
-The script prints the mean click-through rate for both buckets, their difference, and the p-value of
-a standard two-sample t-test computed via `scipy.stats.ttest_ind`. In a successful A/A test you
-should expect a high p-value and a small difference between the two groups.
+## Output
+
+```bash
+>>> uv run python run_aa_test.py --trials 1000 --alpha 0.05
+=== A/A Test Summary ===
+Level: row
+Trials: 1000
+Alpha: 0.05
+False positives: 614 (61.40%)
+=== A/A Test Summary ===
+Level: impression_id
+Trials: 1000
+Alpha: 0.05
+False positives: 324 (32.40%)
+=== A/A Test Summary ===
+Level: user_id
+Trials: 1000
+Alpha: 0.05
+False positives: 56 (5.60%)
+```
